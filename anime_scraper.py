@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import re # For parsing dates
 from datetime import datetime
 import os # For directory and file operations
+from transformers import pipeline # For AI Summarization
 
 # Define the URL to scrape
 URL = "https://myanimelist.net/topanime.php?type=airing"
@@ -57,17 +58,19 @@ def parse_anime_data(html_content):
             
     return anime_list
 
-def get_anime_details(anime_url):
+def get_anime_details(anime_url, anime_title, summarizer, ai_summarization_enabled): # Added summarizer and flag
     """
     Fetches and parses an individual anime page to extract details.
+    Optionally summarizes the synopsis using AI.
     """
-    print(f"Fetching details for: {anime_url}")
+    print(f"Fetching details for: {anime_title} ({anime_url})")
     html_content = fetch_anime_page(anime_url)
     if not html_content:
         return None
 
     soup = BeautifulSoup(html_content, "html.parser")
-    details = {'synopsis': "Synopsis not found.", 'genres': [], 'aired_date_str': None, 'broadcast_info': None, 'country_info': None, 'type': None}
+    details = {'synopsis': "Synopsis not found.", 'genres': [], 'aired_date_str': None, 
+               'broadcast_info': None, 'country_info': None, 'type': None, 'is_ai_summary': False}
 
     synopsis_tag = soup.find('p', itemprop='description')
     if not synopsis_tag:
@@ -78,13 +81,46 @@ def get_anime_details(anime_url):
             story_div = synopsis_div.find('div', class_='story')
             if story_div:
                 details['synopsis'] = story_div.get_text(separator='\n', strip=True)
-            else: # Fallback if no specific 'story' div, take all text from 'synopsis' div
+            else: 
                 details['synopsis'] = synopsis_div.get_text(separator='\n', strip=True)
-    if synopsis_tag and (details['synopsis'] == "Synopsis not found." or not details['synopsis']): # Check if not already populated by div logic
+    if synopsis_tag and (details['synopsis'] == "Synopsis not found." or not details['synopsis']):
         details['synopsis'] = synopsis_tag.get_text(separator='\n', strip=True)
     
-    if not details['synopsis'] or details['synopsis'].strip() == "": # Final check for empty synopsis
+    if not details['synopsis'] or details['synopsis'].strip() == "":
         details['synopsis'] = "Synopsis not available on the page."
+
+    # AI Summarization
+    if ai_summarization_enabled and summarizer and \
+       details['synopsis'] and \
+       "not found" not in details['synopsis'].lower() and \
+       "not available" not in details['synopsis'].lower():
+        try:
+            print(f"Generating AI summary for: {anime_title}...")
+            max_input_length = 1024 # Typical for BART models
+            original_synopsis = details['synopsis']
+            truncated_synopsis = original_synopsis
+
+            # Estimate token count by splitting by space and check against 80% of max_input_length
+            # This is a rough heuristic. Transformers tokenizer.encode would be more accurate.
+            if len(original_synopsis.split()) > int(max_input_length * 0.8): 
+                # Truncate by words to approx 70% of max model input length
+                truncated_synopsis = " ".join(original_synopsis.split()[:int(max_input_length * 0.7)])
+                print(f"Original synopsis for {anime_title} was long, truncated for AI summarizer.")
+
+            summary_list = summarizer(truncated_synopsis, max_length=150, min_length=30, do_sample=False)
+            
+            if summary_list and isinstance(summary_list, list) and len(summary_list) > 0 and 'summary_text' in summary_list[0]:
+                details['synopsis'] = summary_list[0]['summary_text']
+                details['is_ai_summary'] = True 
+                print(f"AI summary generated for {anime_title}.")
+            else:
+                print(f"AI summary generation returned an unexpected result for {anime_title}.")
+                details['is_ai_summary'] = False
+        except Exception as e:
+            print(f"Error during AI summarization for {anime_title}: {e}")
+            details['is_ai_summary'] = False # Keep original synopsis
+    else:
+        details['is_ai_summary'] = False
 
 
     genre_tags = soup.find_all('span', itemprop='genre')
@@ -101,14 +137,12 @@ def get_anime_details(anime_url):
             if next_sibling and isinstance(next_sibling, str) and next_sibling.strip():
                 value = next_sibling.strip()
             
-            # If not found as direct sibling text, try to get from parent, excluding label
             if not value:
                 parent_content = span_tag.parent.get_text(separator=' ', strip=True)
                 value = parent_content.replace(span_tag.get_text(strip=True), "", 1).strip()
                 if value.startswith(":"):
                      value = value[1:].strip()
             
-            # If value is still empty, it might be in an 'a' tag within the parent
             if not value and span_tag.parent.find('a'):
                 value = span_tag.parent.find('a').get_text(strip=True)
 
@@ -137,7 +171,7 @@ def is_currently_airing_japan(aired_date_str, broadcast_info, country_info, anim
 
     try:
         start_date = None
-        possible_formats = ["%b %d, %Y", "%Y", "%b %Y", "%b, %Y"]
+        possible_formats = ["%b %d, %Y", "%Y", "%b %Y", "%b, %Y"] # Added %b, %Y
         for fmt in possible_formats:
             try:
                 start_date = datetime.strptime(start_date_str, fmt)
@@ -145,7 +179,7 @@ def is_currently_airing_japan(aired_date_str, broadcast_info, country_info, anim
             except ValueError:
                 continue
         
-        if start_date and start_date > datetime.now(): return False # Future start date
+        if start_date and start_date > datetime.now(): return False 
 
         if end_date_str:
             end_date_str = end_date_str.strip()
@@ -159,19 +193,17 @@ def is_currently_airing_japan(aired_date_str, broadcast_info, country_info, anim
                         break
                     except ValueError:
                         continue
-                if end_date and end_date < datetime.now(): return False # Ended
+                if end_date and end_date < datetime.now(): return False 
                 elif end_date and end_date >= datetime.now(): is_airing = True
-        else: # No end date
-            if anime_type in ["Movie", "Special", "OVA", "ONA"] and anime_type is not None: # Check anime_type is not None
-                 # For these types, if start date is past, it's not "currently airing TV-style"
+        else: 
+            if anime_type in ["Movie", "Special", "OVA", "ONA"] and anime_type is not None:
                  if start_date and start_date < datetime.now(): return False
-                 elif start_date and start_date >= datetime.now(): is_airing = True # Airing now or upcoming
-            elif anime_type == "TV" and start_date and start_date <= datetime.now(): # For TV, no end date implies airing
+                 elif start_date and start_date >= datetime.now(): is_airing = True
+            elif anime_type == "TV" and start_date and start_date <= datetime.now():
                 is_airing = True
 
 
     except Exception as e:
-        # print(f"Could not parse date string '{aired_date_str}' for {anime_title}: {e}")
         if "to ?" in aired_date_str: is_airing = True
         else: return False
 
@@ -181,13 +213,10 @@ def is_currently_airing_japan(aired_date_str, broadcast_info, country_info, anim
     if broadcast_info and "JST" in broadcast_info: is_japanese_broadcast = True
     if country_info and "Japan" in country_info: is_japanese_broadcast = True
     
-    # Relaxing ONA filter slightly: if country is Japan, it's fine.
     if anime_type == "ONA" and not (country_info and "Japan" in country_info) and not (broadcast_info and "JST" in broadcast_info) :
-        # print(f"Filtering ONA '{anime_title}' due to lack of clear Japanese broadcast/country.")
         return False
 
     if not is_japanese_broadcast:
-        # print(f"Anime '{anime_title}' might not be a Japanese broadcast (Country: {country_info}, Broadcast: {broadcast_info}, Type: {anime_type}).")
         return False
 
     return True
@@ -195,12 +224,25 @@ def is_currently_airing_japan(aired_date_str, broadcast_info, country_info, anim
 
 # Main execution block
 if __name__ == "__main__":
-    print(f"Fetching initial anime list from: {URL}")
+    # Initialize AI Summarizer
+    summarizer = None
+    ai_summarization_enabled = False
+    try:
+        print("Initializing AI summarization model (sshleifer/distilbart-cnn-6-6)...")
+        # Using a specific, smaller model for potentially faster execution 
+        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-6-6")
+        print("AI summarization model initialized successfully.")
+        ai_summarization_enabled = True
+    except Exception as e:
+        print(f"Could not initialize AI summarization model: {e}. AI summarization will be disabled.")
+        # Script will continue without AI summarization
+
+    print(f"\nFetching initial anime list from: {URL}")
     main_page_html = fetch_anime_page(URL)
     
     detailed_animes = []
-    MAX_JAPANESE_ANIMES_TO_COLLECT = 10 # Target for final list
-    MAX_JAPANESE_ANIMES_TO_FIND_INTERNALLY = 15 # Intermediate target during scraping
+    MAX_JAPANESE_ANIMES_TO_COLLECT = 10 
+    MAX_JAPANESE_ANIMES_TO_FIND_INTERNALLY = 15 
     PROCESSED_ENTRIES_LIMIT = 50
 
     if main_page_html:
@@ -210,12 +252,13 @@ if __name__ == "__main__":
         processed_count = 0
         for entry in anime_entries:
             if processed_count >= PROCESSED_ENTRIES_LIMIT or len(detailed_animes) >= MAX_JAPANESE_ANIMES_TO_FIND_INTERNALLY:
-                print(f"Stopping processing: Reached {len(detailed_animes)} potential Japanese animes or processed {processed_count} entries.")
+                print(f"\nStopping processing: Reached {len(detailed_animes)} potential Japanese animes or processed {processed_count} entries.")
                 break
             
             processed_count += 1
             print(f"\nProcessing entry {processed_count}/{min(len(anime_entries), PROCESSED_ENTRIES_LIMIT)}: {entry['title']}")
-            details = get_anime_details(entry['url'])
+            # Pass anime_title, summarizer, and ai_summarization_enabled to get_anime_details
+            details = get_anime_details(entry['url'], entry['title'], summarizer, ai_summarization_enabled) 
             
             if details:
                 if is_currently_airing_japan(details['aired_date_str'], details['broadcast_info'], details['country_info'], details['type'], entry['title']):
@@ -224,9 +267,8 @@ if __name__ == "__main__":
                         'title': entry['title'],
                         'url': entry['url'],
                         'synopsis': details['synopsis'],
-                        'genres': details['genres']
-                        # 'aired_date': details['aired_date_str'], # Keep for debugging if needed
-                        # 'broadcast': details['broadcast_info'] # Keep for debugging if needed
+                        'genres': details['genres'],
+                        'is_ai_summary': details.get('is_ai_summary', False) # Add this flag
                     })
                 else:
                     print(f"FILTERED OUT: '{entry['title']}' (Aired: {details['aired_date_str']}, Broadcast: {details['broadcast_info']}, Country: {details['country_info']}, Type: {details['type']})")
@@ -237,7 +279,6 @@ if __name__ == "__main__":
         if detailed_animes:
             print(f"Found {len(detailed_animes)} Japanese animes matching criteria.")
             
-            # Sort by original order (which is MAL rank), then take top N
             animes_to_save = detailed_animes[:MAX_JAPANESE_ANIMES_TO_COLLECT]
             print(f"Saving top {len(animes_to_save)} animes to Markdown file.")
 
@@ -251,11 +292,14 @@ if __name__ == "__main__":
                 with open(output_filename, 'w', encoding='utf-8') as f:
                     for i, anime in enumerate(animes_to_save):
                         f.write(f"# {anime['title']}\n\n")
-                        f.write(f"## Synopsis\n{anime['synopsis']}\n\n")
+                        f.write(f"## Synopsis\n")
+                        if anime.get('is_ai_summary', False):
+                            f.write("*(AI-generated summary)*\n")
+                        f.write(f"{anime['synopsis']}\n\n")
                         f.write(f"## Categories\n{', '.join(anime['genres'])}\n\n")
                         f.write(f"## Source\n{anime['url']}\n")
                         if i < len(animes_to_save) - 1:
-                            f.write("\n---\n\n") # Horizontal rule between entries
+                            f.write("\n---\n\n") 
                 print(f"\nData successfully saved to: {output_filename}")
             except IOError as e:
                 print(f"Error writing to file {output_filename}: {e}")
@@ -267,4 +311,5 @@ if __name__ == "__main__":
         print("Failed to fetch the main anime list. Cannot proceed.")
 
     print("\nReminder: To run this script, you need to install the following libraries if you haven't already:")
-    print("pip install requests beautifulsoup4")
+    print("pip install requests beautifulsoup4 transformers torch") # Added transformers and torch as typical peer dependency
+    print("(Note: 'torch' might be needed by the transformers pipeline depending on the model. If you encounter issues, try installing it.)")
